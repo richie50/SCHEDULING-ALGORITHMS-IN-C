@@ -1,0 +1,239 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <assert.h>
+#include "sch-helpers.h"
+
+// Some useful global variables
+process processes[MAX_PROCESSES + 1];
+int number_of_processes;
+int nextProcess;
+int context_switches;
+int theClock;
+int last_process_end_time = 0;
+int cpu_utilized_time;
+
+// Ready process queue and waiting process queue
+process_queue readyQueue;
+process_queue waitingQueue;
+
+// CPU's
+process *CPU[NUMBER_OF_PROCESSORS];
+
+// Temporary "Pre-Ready" queue
+process *tmpQueue[MAX_PROCESSES + 1];
+int tmpQueueSize;
+
+void init_(void) {
+    number_of_processes = 0;
+    nextProcess = 0;
+    context_switches = 0;
+    cpu_utilized_time = 0;
+    theClock = 0;
+    tmpQueueSize = 0;
+}
+
+
+int compareArrivalTime(const void *a, const void *b) {
+    process *first = (process *) a;
+    process *second = (process *) b;
+    return first->arrivalTime - second->arrivalTime;
+}
+
+int compareProcessIds(const void *a, const void *b) {
+    process *first = (process *) a;
+    process *second = (process *) b;
+    if (first->pid == second->pid) {
+        error_duplicate_pid(first->pid);
+    }
+    return first->pid - second->pid;
+}
+/**
+ * Move finish process into the waiting queue and terminate finish CPU or I/O bursts
+ */
+void running_process_to_waiting() {
+    int i;
+    for (i = 0; i < NUMBER_OF_PROCESSORS; i++) {
+        if (CPU[i] != NULL) {
+            //printf("CPU BURST && I/O BURST:%d\t", CPU[i]->bursts[CPU[i]->currentBurst].length);
+           // printf("STEPS:%d\n", CPU[i]->bursts[CPU[i]->currentBurst].step);
+            if (CPU[i]->bursts[CPU[i]->currentBurst].step == CPU[i]->bursts[CPU[i]->currentBurst].length) {
+               // printf("**PROCESS:%d HAS FINISHED SOME of ITS WORK**\n", processes[processes[i].currentBurst].pid);
+                //context_switches++;
+                CPU[i]->currentBurst++;
+               // printf("NUMBER OF BURST:%d\n", CPU[i]->numberOfBursts);
+                if (CPU[i]->currentBurst < CPU[i]->numberOfBursts) {
+                    enqueueProcess(&waitingQueue, CPU[i]); // Puts the finish Burst into the waiting queue
+                    //printf("Waiting process id:%d\t&& Current Process id:%d\n", waitingQueue.front->data->pid, CPU[i]->pid);
+                } else {
+                    CPU[i]->endTime = theClock;
+                    last_process_end_time = theClock;
+                }
+                CPU[i] = NULL;
+            }
+        }
+    }
+}
+/**
+ * Iterates over all CPU's and to find and return the total number of 
+ * currently running processes
+ */
+int runningProcesses() {
+    int runningProcesses = 0;
+    int i;
+    for (i = 0; i < NUMBER_OF_PROCESSORS; i++) {
+        if (CPU[i] != NULL) {
+            runningProcesses++;
+        }
+    }
+    return runningProcesses;
+}
+
+/**
+ * Grabs the next scheduled process in the queue (first process currently at
+ * the front of the ready queue). Increments the waiting time in order to update
+ * the ready state. Returns the next process to be run
+ */
+process *get_next_sch_process() {
+    if (readyQueue.size == 0) {
+        return NULL;
+    }
+    process *grabNext = readyQueue.front->data;
+    dequeueProcess(&readyQueue);
+    return grabNext;
+}
+
+/**
+ * Add any new incoming processes to a temporary queue to be sorted and later added
+ * to the ready queue. These incoming processes are put in a "pre-ready queue"
+ */
+void incoming_process_init() {
+    while (nextProcess < number_of_processes && processes[nextProcess].arrivalTime <= theClock) {
+        tmpQueue[tmpQueueSize++] = &processes[nextProcess++];
+    }
+}
+
+void most_ready_running_in_cpu() {
+    int i;
+    qsort(tmpQueue, tmpQueueSize, sizeof (process*), compareProcessIds);
+    //printf("pre_ready size:%d\n" , tmpQueueSize);
+    for (i = 0; i < tmpQueueSize; i++) {
+        enqueueProcess(&readyQueue, tmpQueue[i]);
+        //printf("WHAT IS RUNNING:%d\n", readyQueue.front->data->pid);
+    }
+    // at this point we feed the pre ready process into the CPU
+    tmpQueueSize = 0;
+    for (i = 0; i < NUMBER_OF_PROCESSORS; i++) {
+        if (CPU[i] == NULL) {
+            CPU[i] = get_next_sch_process();
+        }
+    }
+}
+
+void waiting_to_ready() {
+    int i;
+    int waitingQueueSize = waitingQueue.size;
+    for (i = 0; i < waitingQueueSize; i++) {
+        process *ready = waitingQueue.front->data;
+        dequeueProcess(&waitingQueue);
+        if (ready->bursts[ready->currentBurst].step == ready->bursts[ready->currentBurst].length) {
+            //context_switches++; // indicates switching from I/O to CPU
+            ready->currentBurst++;
+            tmpQueue[tmpQueueSize++] = ready;
+        } else {
+            enqueueProcess(&waitingQueue, ready);
+        }
+    }
+}
+
+
+void refresh_processes() {
+    int j;
+    int size = waitingQueue.size;
+    // update waiting state I\O burst
+    for (j = 0; j < size; j++) {
+        process *I_O = waitingQueue.front->data;
+        dequeueProcess(&waitingQueue);
+        I_O->bursts[I_O->currentBurst].step++;
+        enqueueProcess(&waitingQueue, I_O);
+    }
+    // update CPU BOUND process 
+    for (j = 0; j < readyQueue.size; j++) {
+        process *CPU_BOUND = readyQueue.front->data;
+        dequeueProcess(&readyQueue);
+        CPU_BOUND->waitingTime++;
+        enqueueProcess(&readyQueue, CPU_BOUND);
+    }
+    // increases workdone by either I/O or CPU bound process
+    for (j = 0; j < NUMBER_OF_PROCESSORS; j++) {
+        if (CPU[j] != NULL) {
+            CPU[j]->bursts[CPU[j]->currentBurst].step++;
+        }
+    }
+}
+
+int main() {
+    int i;
+    int status = 0;
+    // initialize cpus
+    for (i = 0; i < NUMBER_OF_PROCESSORS; i++) {
+        CPU[i] = NULL;
+    }
+    init_();
+    initializeProcessQueue(&readyQueue);
+    initializeProcessQueue(&waitingQueue);
+
+    // read in process and initialize process values
+    while ((status = (readProcess(&processes[number_of_processes])))) {
+        if (status == 1) {
+            number_of_processes++;
+        }
+        if (number_of_processes > MAX_PROCESSES || number_of_processes == 0) {
+            break;
+        }
+    }
+
+    qsort(processes, number_of_processes, sizeof (process*), compareArrivalTime);
+
+    // main execution loop
+    while (number_of_processes) {
+        incoming_process_init();
+        running_process_to_waiting();
+        most_ready_running_in_cpu();
+        waiting_to_ready();
+
+        refresh_processes();
+
+        cpu_utilized_time += runningProcesses();
+
+        // break when there are no more running or incoming processes, and the waiting queue is empty
+        if (runningProcesses() == 0 && (number_of_processes - nextProcess) == 0 && waitingQueue.size == 0) {
+            break;
+        }
+        theClock++;
+    }
+
+    // calculations
+    int total_waiting_time = 0;
+    int turn_around_time = 0;
+    for (i = 0; i < number_of_processes; i++) {
+        turn_around_time += processes[i].endTime - processes[i].arrivalTime;
+        total_waiting_time += processes[i].waitingTime;
+    }
+    printf("********************************************************************\n");
+    printf("Average Waiting time\t:%.2f\n", total_waiting_time / (double) number_of_processes);
+    printf("Turn around time\t:%.2f\n", turn_around_time / (double) number_of_processes);
+    printf("Time all for all CPU processes\t:%d\n", theClock);
+    printf("CPU utilization time\t:%.2f%\n", ((double) cpu_utilized_time * (double) 100.0) / (double)(theClock));
+    printf("Total Number of Context Switches\t:%d\n" ,context_switches);
+    printf("PID to finish last .....\n");
+    for (i = 0; i < number_of_processes; i++) {
+        if (processes[i].endTime == last_process_end_time) {
+            printf("PID:%d\tENDTIME:%d\n", processes[i].pid , processes[i].endTime);
+        }
+    }
+    printf("********************************************************************\n");
+    //printf("RealTime:%f \n" , system("time"));
+    return 0;
+}
